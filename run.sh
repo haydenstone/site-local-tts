@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-exec python3 "$ROOT/server.py"
+PY="$ROOT/.venv/bin/python"
+if [[ ! -x "$PY" ]]; then
+  PY="$(command -v python3)"
+fi
+exec "$PY" "$ROOT/server.py"

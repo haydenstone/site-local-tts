@@ -1,56 +1,32 @@
 # Site Local TTS
 
-A small local text-to-speech bridge for Linux browsers that avoids the browser's native `speechSynthesis` voice stack entirely.
+Local text-to-speech buttons for ordinary websites, with two independent engines:
 
-It was built after diagnosing a Chromium/Linux failure where:
+- **🔊 eSpeak NG** — tiny, fast, dependable fallback.
+- **🎙️ Piper** — higher-quality local neural speech.
 
-- page text extraction worked,
-- Web Audio worked,
-- `speechSynthesis` existed,
-- `SpeechSynthesisUtterance` existed,
-- `speechSynthesis.getVoices()` stayed empty,
-- `voiceschanged` never fired,
-- every utterance failed at character `0` with `synthesis-failed`.
+This project deliberately bypasses the browser's native `speechSynthesis` voice provider.
 
-Instead of fighting the browser's voice provider, this project uses a simpler path:
+## Architecture
 
 ```text
-website text
+website
    │
-   ▼
-inline 🔊 button
+   ├── 🔊 eSpeak
+   │       │
+   │       ▼
+   │   localhost:8765 → espeak-ng → WAV
    │
-   ▼
-localhost:8765
-   │
-   ▼
-eSpeak NG
-   │
-   ▼
-WAV audio
-   │
-   ▼
-browser <audio>
+   └── 🎙️ Piper
+           │
+           ▼
+       localhost:8765 → cached Piper model → WAV
+                                  │
+                                  ▼
+                            browser audio
 ```
 
-## Can it work on all sites?
-
-**Most ordinary sites: yes. Literally every site: no.**
-
-There are two client modes:
-
-1. **Bookmarklet** — zero extension install, but it runs inside the page's security context. A site's Content Security Policy can block `fetch()` to `127.0.0.1`, and browsers may require explicit permission before an HTTPS page can access loopback/local-network services.
-2. **Userscript (recommended)** — intended for Tampermonkey/Violentmonkey/Greasemonkey-style managers. It uses an extension-provided cross-origin request API when available, which is more reliable on restrictive sites.
-
-Some special browser surfaces cannot be scripted by ordinary extensions/bookmarklets, including browser settings pages, some extension stores, PDF viewers, sandboxed cross-origin frames, and pages where the extension itself is denied access.
-
-## Requirements
-
-- Linux
-- Python 3
-- `espeak-ng`
-- A modern browser
-- Optional but recommended: Tampermonkey or Violentmonkey
+The Piper model is loaded lazily and cached in the local server process, so it is not reloaded for every click.
 
 ## Install
 
@@ -58,90 +34,170 @@ Some special browser surfaces cannot be scripted by ordinary extensions/bookmark
 ./install.sh
 ```
 
-Or manually:
+This installs Python, a private `.venv`, eSpeak NG, and the `piper-tts` Python package.
+
+## Add the default Piper voice
 
 ```bash
-sudo apt update
-sudo apt install -y python3 espeak-ng
+./setup-piper.sh
 ```
 
-## Start the local TTS server
+Default voice:
+
+```text
+en_US-lessac-medium
+```
+
+The model is downloaded into:
+
+```text
+models/en_US-lessac-medium.onnx
+```
+
+To choose another Piper voice:
+
+```bash
+PIPER_VOICE=en_US-amy-medium ./setup-piper.sh
+```
+
+## Start
 
 ```bash
 ./run.sh
 ```
 
-The server listens only on:
+The server binds only to:
 
 ```text
 127.0.0.1:8765
 ```
 
-It is intentionally not exposed to your LAN.
-
-Quick health check:
+## Check both engines
 
 ```bash
 curl http://127.0.0.1:8765/health
 ```
 
-Expected response:
+You should see eSpeak availability plus Piper package/model readiness.
 
-```json
-{"ok": true, "engine": "espeak-ng"}
+Test eSpeak:
+
+```bash
+curl -sS -X POST \
+  --data 'Testing eSpeak.' \
+  'http://127.0.0.1:8765/tts?engine=espeak' \
+  -o /tmp/espeak.wav
 ```
 
-## Option A: Userscript, recommended
+Test Piper:
 
-Open:
+```bash
+curl -sS -X POST \
+  --data 'Testing the Piper neural voice.' \
+  'http://127.0.0.1:8765/tts?engine=piper' \
+  -o /tmp/piper.wav
+```
+
+## Website buttons
+
+Each detected **logical** readable block gets:
 
 ```text
-userscript.user.js
+🔊  🎙️
 ```
 
-Install it in Tampermonkey/Violentmonkey/Greasemonkey.
+- **🔊** speaks through eSpeak NG.
+- **🎙️** speaks through Piper.
+- While synthesizing: `⏳`
+- While playing: `⏹`
+- Click the active button again to stop.
+- `❌` means the local request failed. Hover the button to see the error.
 
-The script scans likely article/chat/message blocks and inserts a small inline:
+The button controls are removed from a cloned DOM node before text extraction, so the button glyphs themselves are not spoken.
+
+
+## 1.2 injection fix
+
+The injector now deliberately avoids the "button confetti" failure mode seen on nested chat layouts:
+
+- chat/assistant selectors take precedence over generic article selectors,
+- nested matches collapse to one logical response,
+- navigation, sidebars, headers, footers, menus, dialogs, and toolbars are excluded,
+- generic fallback runs only when no stronger content selector exists,
+- each target is marked with `data-site-local-tts-bound="1"`,
+- mutations created by the TTS controls themselves do not trigger rebinding,
+- controls from an older release are cleaned before the new binding pass.
+
+On DeepSeek this should produce one `🔊 🎙️` pair per assistant response rather than controls across the sidebar and surrounding layout.
+
+## Client choices
+
+### `userscript.user.js` — recommended
+
+Install it with Tampermonkey or Violentmonkey.
+
+The userscript uses `GM_xmlhttpRequest` when available, making it much more tolerant of sites whose Content Security Policy blocks ordinary page `fetch()` calls to localhost.
+
+### `bookmarklet.js`
+
+A zero-extension option. Copy the single `javascript:` line into the URL field of a browser bookmark.
+
+Bookmarklets can be blocked by restrictive site CSP or local-network/loopback access controls.
+
+## Piper voice configuration
+
+The local server uses:
 
 ```text
-🔊
+models/en_US-lessac-medium.onnx
 ```
 
-button directly into the page.
+by default.
 
-Click once to speak that block. Click the active button again to stop.
+You can point it at any compatible `.onnx` Piper voice at runtime:
 
-### Why the userscript is preferred
+```bash
+PIPER_MODEL=/absolute/path/to/my_voice.onnx ./run.sh
+```
 
-A normal page `fetch()` is controlled by the site's `Content-Security-Policy: connect-src`. The userscript version uses `GM_xmlhttpRequest` when available, so its request is made through the userscript manager rather than ordinary page `fetch()`.
+The companion `.onnx.json` file should remain beside the model.
 
-## Option B: Bookmarklet
+### Piper speed
 
-Open:
+The server accepts `length_scale` on the Piper endpoint:
 
 ```text
-bookmarklet.js
+/tts?engine=piper&length_scale=1.0
 ```
 
-Copy the single `javascript:` line into the URL field of a browser bookmark.
+For Piper:
 
-Visit a page and click the bookmark.
+- lower than `1.0` = faster
+- higher than `1.0` = slower
 
-The script injects inline 🔊 buttons into likely readable content blocks.
+The browser clients currently use the model default (`1.0`).
 
-### Loopback permission
+## eSpeak controls
 
-Modern browsers may ask whether the current website can access a service on your local device. Allow loopback/local-network access for the page if you want the bookmarklet to reach:
+The eSpeak endpoint still supports:
 
 ```text
-http://127.0.0.1:8765
+voice=en-us
+speed=165
+pitch=50
 ```
 
-The bookmarklet also sets `targetAddressSpace: "loopback"` where the browser supports it.
+Example:
 
-## Generic content detection
+```text
+/tts?engine=espeak&voice=en-us&speed=180&pitch=45
+```
 
-The client tries several common content shapes:
+## Supported sites
+
+This can work on most ordinary HTML sites, including chat and article layouts.
+
+Detection includes:
 
 ```text
 [data-message-author-role="assistant"]
@@ -154,99 +210,87 @@ main [class*="markdown"]
 main [class*="message"]
 ```
 
-If none match, it falls back to substantial visible text containers inside `<main>`.
+If none match, the client falls back to substantial visible text blocks under `<main>`.
 
-This is deliberately heuristic. For a site with an unusual DOM, edit the `SELECTORS` list in either client.
+No generic injector can guarantee every site. Browser-internal pages, extension stores, unusual sandboxed frames, highly restrictive sites, and complex custom DOMs may require a site-specific selector or extension permission.
 
 ## DeepSeek
 
-DeepSeek is already covered by:
+DeepSeek is covered by the existing generic selectors:
 
 ```text
 [class*="assistant"][class*="message"]
 .ds-markdown
 ```
 
-so no DeepSeek-specific fork is required.
+No DeepSeek-only branch is required.
 
-## Server API
+## API
 
 ### `GET /health`
 
-Returns basic server health.
+Reports readiness of both engines.
 
-### `POST /tts`
+### `POST /tts?engine=espeak`
 
-Body: UTF-8 plain text.
+Returns `audio/wav`.
 
-Optional query parameters:
+### `POST /tts?engine=piper`
+
+Returns `audio/wav`.
+
+Maximum request body:
 
 ```text
-voice=en-us
-speed=165
-pitch=50
+50,000 bytes
 ```
 
-Example:
-
-```bash
-curl -sS \
-  -X POST \
-  --data 'Hello from local TTS.' \
-  'http://127.0.0.1:8765/tts?voice=en-us&speed=165' \
-  -o /tmp/test.wav
-```
-
-Then play `/tmp/test.wav` using your normal audio player.
-
-## Safety boundaries
+## Security boundaries
 
 The server:
 
-- binds to loopback only,
-- accepts only `/health` and `/tts`,
-- does not execute page-provided shell commands,
-- caps text input size,
-- passes text to `espeak-ng` over stdin,
-- validates numeric voice parameters,
-- does not write user text to disk,
-- does not require root after package installation.
+- binds to `127.0.0.1` only,
+- exposes only `/health` and `/tts`,
+- has no shell-command API,
+- caps input size,
+- does not write submitted text to disk,
+- passes eSpeak text over stdin,
+- loads Piper only from the configured local model path.
 
-## Troubleshooting
+## Troubleshooting Piper
 
-### Button shows ❌
+### 🎙️ becomes ❌
 
-First confirm the server is running:
+Check:
 
 ```bash
 curl http://127.0.0.1:8765/health
 ```
 
-If that works but the bookmarklet fails, the site/browser is probably blocking the page-to-loopback request. Use the userscript instead.
-
-### Browser asks for local network permission
-
-Allow it if you want that origin to use the local TTS server.
-
-### No buttons appear
-
-Run this in DevTools:
-
-```javascript
-document.querySelectorAll('article,[role="article"],.ds-markdown,[class*="message"]').length
-```
-
-If it returns `0`, add an appropriate selector to `SELECTORS`.
-
-### eSpeak itself is silent
-
-Test directly:
+If `piper.ready` is false, run:
 
 ```bash
-espeak-ng "Local speech engine test."
+./install.sh
+./setup-piper.sh
+./run.sh
 ```
 
-If that is silent too, fix the OS audio path first.
+### First Piper click is slower
+
+Expected. The neural model is loaded on first Piper use and then cached.
+
+### Use a different voice
+
+```bash
+PIPER_VOICE=<voice-name> ./setup-piper.sh
+PIPER_MODEL="$PWD/models/<voice-name>.onnx" ./run.sh
+```
+
+## Current Piper implementation
+
+This repo targets the actively maintained **OHF-Voice/piper1-gpl** Python package (`piper-tts`). Piper's current documented Python API supports `PiperVoice.load(...)` and `synthesize_wav(...)`, which is what this local bridge uses.
+
+Piper itself is GPL-3.0 licensed and is installed as an external dependency. This repository does not bundle Piper's source or binaries.
 
 ## Files
 
@@ -256,21 +300,13 @@ site-local-tts/
 ├── LICENSE
 ├── .gitignore
 ├── install.sh
+├── setup-piper.sh
 ├── run.sh
 ├── server.py
 ├── bookmarklet.js
 └── userscript.user.js
 ```
 
-## References
-
-- MDN: Local network access
-  https://developer.mozilla.org/en-US/docs/Web/Security/Defenses/Local_network_access
-- MDN: CSP `connect-src`
-  https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy/connect-src
-- MDN: `Request.targetAddressSpace`
-  https://developer.mozilla.org/en-US/docs/Web/API/Request/targetAddressSpace
-
 ## License
 
-MIT
+MIT for this repository's original code. Piper is a separate GPL-3.0 dependency.

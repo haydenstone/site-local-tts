@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Site Local TTS
+// @name         Site Local TTS — eSpeak + Piper
 // @namespace    local.site.tts
-// @version      1.0.0
-// @description  Adds inline local eSpeak-NG TTS buttons to readable page content.
+// @version      1.2.0
+// @description  Adds one inline eSpeak/Piper TTS control pair per readable response/article.
 // @match        http://*/*
 // @match        https://*/*
 // @grant        GM_xmlhttpRequest
@@ -14,30 +14,43 @@
   "use strict";
 
   if (window.__SITE_LOCAL_TTS_USER__) return;
-  window.__SITE_LOCAL_TTS_USER__ = true;
+  window.__SITE_LOCAL_TTS_USER__ = {};
 
-  const ENDPOINT = "http://127.0.0.1:8765/tts";
-  const SELECTORS = [
+  const BASE = "http://127.0.0.1:8765/tts";
+
+  const PRIMARY_SELECTORS = [
     '[data-message-author-role="assistant"]',
     '[data-role="assistant"]',
     '[class*="assistant"][class*="message"]',
-    '.ds-markdown',
+    '.ds-markdown'
+  ];
+
+  const ARTICLE_SELECTORS = [
     'article',
     '[role="article"]',
     'main [class*="markdown"]',
     'main [class*="message"]'
   ];
 
+  const UI_ANCESTORS =
+    'nav,aside,header,footer,[role="navigation"],[role="menu"],' +
+    '[role="dialog"],[role="toolbar"],[aria-hidden="true"]';
+
   let currentAudio = null;
   let currentButton = null;
+  let injecting = false;
 
-  const clean = text =>
-    String(text || "").replace(/\s+/g, " ").replace(/^🔊\s*/, "").trim();
+  const cleanText = el => {
+    const clone = el.cloneNode(true);
+    clone.querySelectorAll(".site-local-tts-controls").forEach(x => x.remove());
+    return String(clone.innerText || "").replace(/\s+/g, " ").trim();
+  };
 
   const visible = el => {
+    if (!el || el.closest(UI_ANCESTORS)) return false;
     const r = el.getBoundingClientRect();
     const s = getComputedStyle(el);
-    return r.width > 80 && r.height > 20 &&
+    return r.width > 120 && r.height > 24 &&
       s.display !== "none" && s.visibility !== "hidden";
   };
 
@@ -47,21 +60,27 @@
       currentAudio.src = "";
       currentAudio = null;
     }
-    if (currentButton) currentButton.textContent = "🔊";
+    if (currentButton) currentButton.textContent = currentButton.dataset.icon;
     currentButton = null;
   };
 
-  const requestAudio = text => new Promise((resolve, reject) => {
+  const requestAudio = (text, engine) => new Promise((resolve, reject) => {
+    const url = `${BASE}?engine=${encodeURIComponent(engine)}`;
+
     if (typeof GM_xmlhttpRequest === "function") {
       GM_xmlhttpRequest({
         method: "POST",
-        url: ENDPOINT,
+        url,
         headers: {"Content-Type": "text/plain;charset=UTF-8"},
-        data: clean(text),
+        data: text,
         responseType: "blob",
         onload: r => {
           if (r.status >= 200 && r.status < 300) resolve(r.response);
-          else reject(new Error(`TTS HTTP ${r.status}`));
+          else reject(new Error(
+            typeof r.responseText === "string" && r.responseText
+              ? r.responseText
+              : `TTS HTTP ${r.status}`
+          ));
         },
         onerror: () => reject(new Error("Local TTS request failed"))
       });
@@ -71,27 +90,31 @@
     const opts = {
       method: "POST",
       mode: "cors",
-      body: clean(text),
+      body: text,
       headers: {"Content-Type": "text/plain;charset=UTF-8"}
     };
-
     try { opts.targetAddressSpace = "loopback"; } catch {}
 
-    fetch(new Request(ENDPOINT, opts))
-      .then(r => {
-        if (!r.ok) throw new Error(`TTS HTTP ${r.status}`);
+    fetch(new Request(url, opts))
+      .then(async r => {
+        if (!r.ok) throw new Error(await r.text() || `TTS HTTP ${r.status}`);
         return r.blob();
       })
       .then(resolve, reject);
   });
 
-  const speak = async (text, button) => {
+  const speak = async (el, button, engine) => {
+    if (currentButton === button && currentAudio) {
+      stop();
+      return;
+    }
+
     stop();
     button.textContent = "⏳";
     currentButton = button;
 
     try {
-      const blob = await requestAudio(text);
+      const blob = await requestAudio(cleanText(el), engine);
       const url = URL.createObjectURL(blob);
       currentAudio = new Audio(url);
 
@@ -110,66 +133,123 @@
       button.textContent = "⏹";
       await currentAudio.play();
     } catch (error) {
-      console.error("[Site Local TTS]", error);
+      console.error(`[Site Local TTS:${engine}]`, error);
       button.textContent = "❌";
-      button.title = String(error);
+      button.title = String(error).trim();
       currentAudio = null;
       currentButton = null;
     }
   };
 
-  const candidates = () => {
-    const seen = new Set();
+  const uniqueLogicalBlocks = list => {
     const out = [];
-
-    for (const selector of SELECTORS) {
-      document.querySelectorAll(selector).forEach(el => {
-        if (seen.has(el) || !visible(el) || clean(el.innerText).length < 40) return;
-        seen.add(el);
-        out.push(el);
-      });
+    for (const el of list) {
+      if (!visible(el)) continue;
+      if (cleanText(el).length < 40) continue;
+      if (out.some(x => x === el || x.contains(el) || el.contains(x))) continue;
+      out.push(el);
     }
-
-    if (!out.length) {
-      const root = document.querySelector("main") || document.body;
-      root.querySelectorAll("section,div").forEach(el => {
-        if (!visible(el)) return;
-        const text = clean(el.innerText);
-        if (text.length < 120 || text.length > 20000) return;
-        const substantialChildren = [...el.children]
-          .filter(c => clean(c.innerText).length > 100).length;
-        if (substantialChildren <= 3) out.push(el);
-      });
-    }
-
     return out;
   };
 
-  const addButtons = () => {
-    candidates().forEach(el => {
-      if (el.querySelector(":scope > .site-local-tts-button")) return;
-
-      const button = document.createElement("button");
-      button.className = "site-local-tts-button";
-      button.textContent = "🔊";
-      button.title = "Read this block";
-      button.style.cssText =
-        "margin:4px 6px 4px 0;padding:2px 7px;border:1px solid #7776;" +
-        "border-radius:6px;background:transparent;color:inherit;cursor:pointer;" +
-        "font:14px system-ui;line-height:1.4;vertical-align:middle";
-
-      button.addEventListener("click", event => {
-        event.preventDefault();
-        event.stopPropagation();
-        if (currentButton === button && currentAudio) stop();
-        else speak(el.innerText, button);
-      });
-
-      el.prepend(button);
-    });
+  const queryOrdered = selectors => {
+    const found = [];
+    for (const selector of selectors) {
+      document.querySelectorAll(selector).forEach(el => found.push(el));
+    }
+    return uniqueLogicalBlocks(found);
   };
 
+  const fallbackBlocks = () => {
+    const root = document.querySelector("main");
+    if (!root) return [];
+
+    return uniqueLogicalBlocks(
+      [...root.querySelectorAll("article,section,[role='article']")]
+        .filter(el => {
+          if (!visible(el)) return false;
+          const text = cleanText(el);
+          if (text.length < 120 || text.length > 30000) return false;
+          const substantial = [...el.children]
+            .filter(c => cleanText(c).length > 120).length;
+          return substantial <= 4;
+        })
+    );
+  };
+
+  const candidates = () => {
+    const primary = queryOrdered(PRIMARY_SELECTORS);
+    if (primary.length) return primary;
+
+    const articles = queryOrdered(ARTICLE_SELECTORS);
+    if (articles.length) return articles;
+
+    return fallbackBlocks();
+  };
+
+  const makeButton = (icon, label, engine, el) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = icon;
+    b.dataset.icon = icon;
+    b.title = label;
+    b.setAttribute("aria-label", label);
+    b.style.cssText =
+      "margin:0 3px;padding:2px 7px;border:1px solid #7776;border-radius:6px;" +
+      "background:transparent;color:inherit;cursor:pointer;font:14px system-ui;" +
+      "line-height:1.4;vertical-align:middle";
+
+    b.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      speak(el, b, engine);
+    });
+
+    return b;
+  };
+
+  const addButtons = () => {
+    if (injecting) return;
+    injecting = true;
+
+    try {
+      candidates().forEach(el => {
+        if (el.dataset.siteLocalTtsBound === "1") return;
+
+        el.querySelectorAll(".site-local-tts-controls").forEach(x => x.remove());
+
+        const controls = document.createElement("span");
+        controls.className = "site-local-tts-controls";
+        controls.dataset.siteLocalTts = "1";
+        controls.style.cssText =
+          "display:inline-flex;align-items:center;gap:2px;margin:4px 6px 4px 0";
+
+        controls.append(
+          makeButton("🔊", "Read with eSpeak NG", "espeak", el),
+          makeButton("🎙️", "Read with Piper neural voice", "piper", el)
+        );
+
+        el.dataset.siteLocalTtsBound = "1";
+        el.prepend(controls);
+      });
+    } finally {
+      injecting = false;
+    }
+  };
+
+  document.querySelectorAll(".site-local-tts-controls").forEach(x => x.remove());
+  document.querySelectorAll("[data-site-local-tts-bound]")
+    .forEach(x => delete x.dataset.siteLocalTtsBound);
+
   addButtons();
-  new MutationObserver(addButtons)
-    .observe(document.body, {childList: true, subtree: true});
+
+  const observer = new MutationObserver(mutations => {
+    const external = mutations.some(m =>
+      !m.target.closest?.(".site-local-tts-controls")
+    );
+    if (external) addButtons();
+  });
+
+  observer.observe(document.body, {childList: true, subtree: true});
+  window.__SITE_LOCAL_TTS_USER__.observer = observer;
 })();

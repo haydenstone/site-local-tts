@@ -1,23 +1,49 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import io
 import json
+import os
 import shutil
 import subprocess
+import threading
 import urllib.parse
+import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 HOST = "127.0.0.1"
-PORT = 8765
+PORT = int(os.environ.get("SITE_LOCAL_TTS_PORT", "8765"))
 MAX_TEXT_BYTES = 50_000
+ROOT = Path(__file__).resolve().parent
+DEFAULT_PIPER_MODEL = ROOT / "models" / "en_US-lessac-medium.onnx"
+PIPER_MODEL = Path(os.environ.get("PIPER_MODEL", str(DEFAULT_PIPER_MODEL)))
 
-if not shutil.which("espeak-ng"):
-    raise SystemExit("ERROR: espeak-ng not found. Run ./install.sh first.")
+_PIPER_VOICE = None
+_PIPER_LOCK = threading.Lock()
+
+try:
+    from piper import PiperVoice, SynthesisConfig  # type: ignore
+    PIPER_IMPORT_OK = True
+    PIPER_IMPORT_ERROR = None
+except Exception as exc:
+    PiperVoice = None
+    SynthesisConfig = None
+    PIPER_IMPORT_OK = False
+    PIPER_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
 
 def clamp_int(value: str | None, default: int, lo: int, hi: int) -> int:
     try:
         n = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, n))
+
+
+def clamp_float(value: str | None, default: float, lo: float, hi: float) -> float:
+    try:
+        n = float(value) if value is not None else default
     except (TypeError, ValueError):
         return default
     return max(lo, min(hi, n))
@@ -30,12 +56,82 @@ def safe_voice(value: str | None) -> str:
     return allowed[:40] or "en-us"
 
 
+def piper_status() -> dict:
+    return {
+        "import_ok": PIPER_IMPORT_OK,
+        "model": str(PIPER_MODEL),
+        "model_exists": PIPER_MODEL.is_file(),
+        "ready": bool(PIPER_IMPORT_OK and PIPER_MODEL.is_file()),
+        "import_error": PIPER_IMPORT_ERROR,
+    }
+
+
+def get_piper_voice():
+    global _PIPER_VOICE
+    if not PIPER_IMPORT_OK:
+        raise RuntimeError(f"Piper Python package unavailable: {PIPER_IMPORT_ERROR}")
+    if not PIPER_MODEL.is_file():
+        raise RuntimeError(
+            f"Piper model missing: {PIPER_MODEL}. Run ./setup-piper.sh"
+        )
+    if _PIPER_VOICE is None:
+        with _PIPER_LOCK:
+            if _PIPER_VOICE is None:
+                _PIPER_VOICE = PiperVoice.load(str(PIPER_MODEL))
+    return _PIPER_VOICE
+
+
+def synth_espeak(text: bytes, query: dict[str, list[str]]) -> bytes:
+    if not shutil.which("espeak-ng"):
+        raise RuntimeError("espeak-ng not found; run ./install.sh")
+
+    voice = safe_voice(query.get("voice", ["en-us"])[0])
+    speed = clamp_int(query.get("speed", ["165"])[0], 165, 80, 450)
+    pitch = clamp_int(query.get("pitch", ["50"])[0], 50, 0, 99)
+
+    proc = subprocess.run(
+        [
+            "espeak-ng",
+            "--stdout",
+            "--stdin",
+            "-v", voice,
+            "-s", str(speed),
+            "-p", str(pitch),
+        ],
+        input=text,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=30,
+        check=False,
+    )
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            (proc.stderr or b"espeak-ng failed").decode("utf-8", "replace")[:4096]
+        )
+    return proc.stdout
+
+
+def synth_piper(text: str, query: dict[str, list[str]]) -> bytes:
+    voice = get_piper_voice()
+
+    # Piper length_scale: lower=faster, higher=slower.
+    length_scale = clamp_float(
+        query.get("length_scale", ["1.0"])[0], 1.0, 0.25, 4.0
+    )
+
+    syn_config = SynthesisConfig(length_scale=length_scale)
+
+    with io.BytesIO() as wav_io:
+        with wave.open(wav_io, "wb") as wav_file:
+            voice.synthesize_wav(text, wav_file, syn_config=syn_config)
+        return wav_io.getvalue()
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "SiteLocalTTS/1.0"
+    server_version = "SiteLocalTTS/1.1"
 
     def cors(self) -> None:
-        # Browser-side access is deliberately permissive, but the service only
-        # binds to 127.0.0.1 and exposes no filesystem or command endpoint.
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
@@ -60,7 +156,17 @@ class Handler(BaseHTTPRequestHandler):
         if path != "/health":
             self.send_bytes(404, b"not found\n", "text/plain; charset=utf-8")
             return
-        body = json.dumps({"ok": True, "engine": "espeak-ng"}).encode()
+
+        body = json.dumps(
+            {
+                "ok": True,
+                "engines": {
+                    "espeak": bool(shutil.which("espeak-ng")),
+                    "piper": piper_status(),
+                },
+            },
+            indent=2,
+        ).encode()
         self.send_bytes(200, body, "application/json")
 
     def do_POST(self) -> None:
@@ -82,40 +188,27 @@ class Handler(BaseHTTPRequestHandler):
             self.send_bytes(413, b"text too large\n", "text/plain; charset=utf-8")
             return
 
-        text = self.rfile.read(length)
-        if not text.strip():
+        raw = self.rfile.read(length)
+        if not raw.strip():
             self.send_bytes(400, b"empty text\n", "text/plain; charset=utf-8")
             return
 
-        params = urllib.parse.parse_qs(parsed.query)
-        voice = safe_voice(params.get("voice", ["en-us"])[0])
-        speed = clamp_int(params.get("speed", ["165"])[0], 165, 80, 450)
-        pitch = clamp_int(params.get("pitch", ["50"])[0], 50, 0, 99)
+        query = urllib.parse.parse_qs(parsed.query)
+        engine = query.get("engine", ["espeak"])[0].lower()
 
-        cmd = [
-            "espeak-ng",
-            "--stdout",
-            "--stdin",
-            "-v", voice,
-            "-s", str(speed),
-            "-p", str(pitch),
-        ]
-
-        proc = subprocess.run(
-            cmd,
-            input=text,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=30,
-            check=False,
-        )
-
-        if proc.returncode != 0:
-            msg = proc.stderr or b"espeak-ng failed\n"
-            self.send_bytes(500, msg[:4096], "text/plain; charset=utf-8")
+        try:
+            if engine == "espeak":
+                wav = synth_espeak(raw, query)
+            elif engine == "piper":
+                wav = synth_piper(raw.decode("utf-8", "replace"), query)
+            else:
+                raise RuntimeError(f"unknown engine: {engine}")
+        except Exception as exc:
+            message = f"{type(exc).__name__}: {exc}\n".encode()
+            self.send_bytes(503, message[:8192], "text/plain; charset=utf-8")
             return
 
-        self.send_bytes(200, proc.stdout, "audio/wav")
+        self.send_bytes(200, wav, "audio/wav")
 
     def log_message(self, fmt: str, *args) -> None:
         print("[site-local-tts]", fmt % args)
@@ -123,4 +216,11 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"Site Local TTS listening on http://{HOST}:{PORT}")
+    print(f"eSpeak: {'ready' if shutil.which('espeak-ng') else 'missing'}")
+    ps = piper_status()
+    print(
+        "Piper:",
+        "ready" if ps["ready"] else
+        f"not ready (import_ok={ps['import_ok']}, model_exists={ps['model_exists']})"
+    )
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
